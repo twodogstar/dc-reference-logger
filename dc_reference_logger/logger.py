@@ -1,7 +1,7 @@
 """Command-line acquisition and durable run records."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import csv
 from datetime import datetime
 import json
@@ -19,6 +19,8 @@ from . import __version__
 from .meter import GPIB_RESOURCE, MeterError, configure, is_34401a, open_meter, read_voltage
 
 COLUMNS = ("timestamp", "elapsed_s", "volts", "delta_ppm")
+EVENT_COLUMNS = ("timestamp", "elapsed_s", "phase", "error_type", "message", "consecutive_failures")
+RETRY_DELAY_S = 1.0
 
 
 def positive_duration(value):
@@ -50,6 +52,10 @@ def parse_args(argv):
     parser.add_argument("--reference", help="optional reference label stored in the run record")
     parser.add_argument("--backend", default="@py", help="PyVISA backend (default %(default)s)")
     parser.add_argument("--timeout-ms", type=int, default=30000, help="VISA I/O timeout (default %(default)s)")
+    parser.add_argument(
+        "--max-consecutive-failures", type=int, default=5,
+        help="stop after this many consecutive failed attempts (default %(default)s)",
+    )
     parser.add_argument("--nplc", type=float, choices=(0.02, 0.2, 1, 10, 100), default=100)
     parser.add_argument("--interval", type=nonnegative_interval, default=0, help="seconds between reading starts, or 0 for back-to-back hardware reads")
     parser.add_argument("--duration", type=positive_duration, help="acquisition duration, e.g. 15s or 12h")
@@ -62,6 +68,8 @@ def parse_args(argv):
         args.resource = args.resource.upper()
     if not 1 <= args.timeout_ms <= 2_147_483_647:
         parser.error("--timeout-ms must be between 1 and 2147483647")
+    if args.max_consecutive_failures < 1:
+        parser.error("--max-consecutive-failures must be at least 1")
     if args.out and args.out.suffix.lower() != ".csv":
         parser.error("--out must end in .csv")
     if args.simulate and not args.interval:
@@ -103,21 +111,31 @@ def save_metadata(path, metadata):
 
 
 @contextmanager
-def reserve_outputs(csv_path, metadata_path, metadata):
+def reserve_outputs(csv_path, metadata_path, events_path, metadata):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    # Reserve the sidecar first so concurrent runs cannot claim either file.
-    with metadata_path.open("x", encoding="utf-8") as output:
+    # Claim each output exclusively, rolling back only paths this run created.
+    paths = (metadata_path, csv_path, events_path)
+    with ExitStack() as files:
+        streams = []
         try:
-            csv_file = csv_path.open("x", encoding="utf-8", newline="")
+            for path in paths:
+                streams.append(files.enter_context(path.open("x", encoding="utf-8", newline="")))
         except OSError:
-            metadata_path.unlink()
+            files.close()
+            for path in paths[:len(streams)]:
+                path.unlink()
             raise
-    with csv_file:
+
+        metadata_file, samples, events = streams
+        metadata_file.close()
         save_metadata(metadata_path, metadata)
-        writer = csv.writer(csv_file)
-        writer.writerow(COLUMNS)
-        csv_file.flush()
-        yield csv_file, writer
+        sample_writer = csv.writer(samples)
+        event_writer = csv.writer(events)
+        sample_writer.writerow(COLUMNS)
+        event_writer.writerow(EVENT_COLUMNS)
+        samples.flush()
+        events.flush()
+        yield samples, sample_writer, events, event_writer
 
 
 class Stats:
@@ -148,7 +166,10 @@ class Stats:
         }
 
 
-def acquire(meter, args, stop, metadata, csv_file, writer, stats):
+def acquire(meter, transport_errors, args, stop, metadata, outputs, stats):
+    samples, sample_writer, events, event_writer = outputs
+    retryable = (MeterError, OSError, UnicodeError) + transport_errors
+    errors = metadata["acquisition_errors"]
     first = None
     start = time.monotonic()
     deadline = math.inf if args.duration is None else start + args.duration
@@ -161,19 +182,48 @@ def acquire(meter, args, stop, metadata, csv_file, writer, stats):
             time.sleep(min(0.2, target - now, deadline - now))
             continue
 
-        raw = meter.query("READ?").strip()
-        volts = read_voltage(raw)
-        finished = time.monotonic()
-        timestamp = wall_time()
-        if first is None:
-            first = volts
-        ppm = (volts - first) / first * 1e6 if first else None
-        ppm_field = f"{ppm:+.3f}" if ppm is not None and math.isfinite(ppm) else ""
-        writer.writerow((timestamp, f"{finished - start:.6f}", raw, ppm_field))
-        csv_file.flush()
-        stats.add(volts)
-        ppm_label = f"{ppm_field} ppm" if ppm_field else "ppm unavailable"
-        print(f"{timestamp}  #{stats.count:<6} {volts:.8f} V  {ppm_label}", flush=True)
+        phase = "device_clear"
+        try:
+            if errors["consecutive"]:
+                # An earlier READ? may still have a response queued.
+                meter.clear()
+                if stop["requested"] or time.monotonic() >= deadline:
+                    break
+            phase = "read"
+            raw = meter.query("READ?").strip()
+            volts = read_voltage(raw)
+        except retryable as exc:
+            finished = time.monotonic()
+            errors["total"] += 1
+            errors[phase] += 1
+            errors["consecutive"] += 1
+            streak = errors["consecutive"]
+            errors["max_consecutive"] = max(errors["max_consecutive"], streak)
+            message = f"{type(exc).__name__}: {exc}"
+            event_writer.writerow((
+                wall_time(), f"{finished - start:.6f}", phase,
+                type(exc).__name__, str(exc), streak,
+            ))
+            events.flush()
+            print(
+                f"Acquisition warning ({streak}/{args.max_consecutive_failures}, {phase}): {message}",
+                file=sys.stderr, flush=True,
+            )
+            if streak >= args.max_consecutive_failures and not stop["requested"]:
+                raise MeterError(f"Reached {streak} consecutive acquisition failures: {message}") from exc
+        else:
+            finished = time.monotonic()
+            errors["consecutive"] = 0
+            timestamp = wall_time()
+            if first is None:
+                first = volts
+            ppm = (volts - first) / first * 1e6 if first else None
+            ppm_field = f"{ppm:+.3f}" if ppm is not None and math.isfinite(ppm) else ""
+            sample_writer.writerow((timestamp, f"{finished - start:.6f}", raw, ppm_field))
+            samples.flush()
+            stats.add(volts)
+            ppm_label = f"{ppm_field} ppm" if ppm_field else "ppm unavailable"
+            print(f"{timestamp}  #{stats.count:<6} {volts:.8f} V  {ppm_label}", flush=True)
 
         if args.interval:
             target += args.interval
@@ -183,6 +233,8 @@ def acquire(meter, args, stop, metadata, csv_file, writer, stats):
                 if missed > 0:
                     metadata["missed_starts"] += missed
                     target += missed * args.interval
+        elif errors["consecutive"]:
+            target = finished + RETRY_DELAY_S
     return "operator_stop" if stop["requested"] else "duration_elapsed"
 
 
@@ -190,6 +242,7 @@ def run(args, stop):
     run_id = uuid4().hex
     csv_path = args.out or Path("runs") / f"dcv_{datetime.now():%Y%m%d_%H%M%S}_{run_id[:8]}.csv"
     metadata_path = csv_path.with_suffix(".json")
+    events_path = csv_path.with_suffix(".events.csv")
     stats = Stats()
     metadata = {
         "schema_version": 1,
@@ -206,6 +259,9 @@ def run(args, stop):
         "finished_at": None,
         "sample_csv": csv_path.name,
         "sample_count": 0,
+        "events_csv": events_path.name,
+        "max_consecutive_failures": args.max_consecutive_failures,
+        "acquisition_errors": {"total": 0, "read": 0, "device_clear": 0, "consecutive": 0, "max_consecutive": 0},
         "missed_starts": 0,
         "duration_s": args.duration,
         "interval_s": args.interval,
@@ -222,10 +278,10 @@ def run(args, stop):
         "cleanup_warnings": [],
         "statistics": None,
     }
-    with reserve_outputs(csv_path, metadata_path, metadata) as (csv_file, writer):
-        print(f"CSV: {csv_path}\nRun record: {metadata_path}", flush=True)
+    with reserve_outputs(csv_path, metadata_path, events_path, metadata) as outputs:
+        print(f"CSV: {csv_path}\nRun record: {metadata_path}\nEvents: {events_path}", flush=True)
         try:
-            with open_meter(args, metadata["cleanup_warnings"]) as meter:
+            with open_meter(args, metadata["cleanup_warnings"]) as (meter, transport_errors):
                 identity = meter.query("*IDN?").strip()
                 metadata["instrument_id"] = identity
                 if not is_34401a(identity):
@@ -234,7 +290,7 @@ def run(args, stop):
                     configure(meter, metadata["requested_settings"], metadata["settings_readback"])
                     metadata["configuration_verified"] = True
                 save_metadata(metadata_path, metadata)
-                metadata["termination"] = acquire(meter, args, stop, metadata, csv_file, writer, stats)
+                metadata["termination"] = acquire(meter, transport_errors, args, stop, metadata, outputs, stats)
         except KeyboardInterrupt:
             metadata["termination"] = "operator_stop"
         except Exception as exc:
@@ -250,7 +306,10 @@ def run(args, stop):
         print(metadata["error"], file=sys.stderr)
     for warning in metadata["cleanup_warnings"]:
         print(f"Cleanup warning: {warning}", file=sys.stderr)
-    print(f"{metadata['termination']}: {stats.count} samples saved.")
+    print(
+        f"{metadata['termination']}: {stats.count} samples saved, "
+        f"{metadata['acquisition_errors']['total']} acquisition errors."
+    )
     return 1 if metadata["termination"] == "failed" else 0
 
 

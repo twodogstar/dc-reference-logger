@@ -91,6 +91,7 @@ def visa_meter(resource, backend, timeout_ms, cleanup_errors):
     try:
         import pyvisa
         from pyvisa.constants import RENLineOperation
+        from pyvisa.errors import VisaIOError
     except ImportError as exc:
         raise MeterError("PyVISA is missing. See README.md for the hardware setup.") from exc
 
@@ -103,7 +104,7 @@ def visa_meter(resource, backend, timeout_ms, cleanup_errors):
         meter.write_termination = "\n"
         meter.read_termination = None
         meter.send_end = True
-        yield meter
+        yield meter, (VisaIOError,)
     finally:
         cleanup = []
         if meter is not None:
@@ -148,6 +149,9 @@ class SimulatedMeter:
         if command.startswith("VOLT:DC:NPLC "):
             self.nplc = command.split()[-1]
 
+    def clear(self):
+        """The simulator has no pending responses to discard."""
+
     def query(self, command):
         if command == "READ?":
             return next(self.samples)
@@ -170,5 +174,5 @@ class SimulatedMeter:
 
 def open_meter(args, cleanup_errors):
     if args.simulate:
-        return nullcontext(SimulatedMeter())
+        return nullcontext((SimulatedMeter(), ()))
     return visa_meter(args.resource, args.backend, args.timeout_ms, cleanup_errors)
