@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dc-reference-logger"
+dynamic = ["version"]
+description = "Standalone DC reference logger for the HP 34401A"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+hardware = ["PyVISA>=1.14,<2", "PyVISA-py>=0.7,<1", "gpib-ctypes>=0.3,<1"]
+
+[project.scripts]
+dc-reference-logger = "dc_reference_logger.logger:main"
+
+[tool.setuptools]
+packages = ["dc_reference_logger"]
+
+[tool.setuptools.dynamic]
+version = {attr = "dc_reference_logger.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
